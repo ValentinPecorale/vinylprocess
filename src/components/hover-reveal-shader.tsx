@@ -361,6 +361,15 @@ const ROTATE_PITCH_LIMIT = Math.PI / 3
 type TouchGestureCallbacks = {
   onRotateMove?: (dx: number, dy: number) => void
   onPaintStart?: () => void
+  // Temporary diagnostic counters for the "2nd reveal doesn't work on
+  // mobile" report -- surfaced by the ?debug=1 HUD in HoverRevealShader.
+  // Remove once that's root-caused.
+  debug: {
+    touches: number
+    mode: string
+    paintStarts: number
+    snapshots: number
+  }
 }
 
 // Right-drag to rotate the model, implemented by hand rather than via
@@ -526,6 +535,7 @@ function useStrokeSnapshotTexture(
     gl.setRenderTarget(state.rt)
     gl.render(state.scene, state.camera)
     gl.setRenderTarget(null)
+    touchGestureRef.current.debug.snapshots++
   })
 
   return snapshotRef
@@ -548,11 +558,16 @@ function useStrokeSnapshotTexture(
 function createTouchGestureController(
   wrapperEl: HTMLElement,
   canvasEl: HTMLCanvasElement | null,
-  { onPaintStart, onRotateMove }: TouchGestureCallbacks
+  { onPaintStart, onRotateMove, debug }: TouchGestureCallbacks
 ) {
   const touches = new Map<number, { x: number; y: number }>()
   let mode: "idle" | "paint" | "rotate" = "idle"
   let primaryId: number | null = null
+
+  function syncDebug() {
+    debug.touches = touches.size
+    debug.mode = mode
+  }
 
   function onWrapperPointerDownCapture(event: PointerEvent) {
     // Mouse pointerdown is left alone here, matching the existing
@@ -564,6 +579,8 @@ function createTouchGestureController(
     if (wasEmpty) {
       primaryId = event.pointerId
       mode = "paint"
+      debug.paintStarts++
+      syncDebug()
       onPaintStart?.()
       // First finger's own touchdown is a legitimate first stroke sample --
       // let it through.
@@ -571,7 +588,14 @@ function createTouchGestureController(
     }
     if (touches.size === 2) {
       mode = "rotate"
+      // Rotation is driven by the 2nd finger to land, not the 1st -- the
+      // 1st finger was already dragging to paint, so its own motion up to
+      // this point (and the arm/hand position behind it) isn't a natural
+      // rotate gesture; the 2nd finger's landing is a fresh, deliberate
+      // point to drag from.
+      primaryId = event.pointerId
     }
+    syncDebug()
     // Any touchdown beyond the first (the 2nd finger landing, or a stray
     // 3rd+) must never reach the fluid canvas as a paint sample.
     event.stopPropagation()
@@ -593,6 +617,7 @@ function createTouchGestureController(
     if (touches.size === 0) {
       mode = "idle"
       primaryId = null
+      syncDebug()
       return
     }
 
@@ -613,6 +638,7 @@ function createTouchGestureController(
       primaryId = remaining
       mode = "paint"
     }
+    syncDebug()
   }
 
   function onWindowPointerMove(event: PointerEvent) {
@@ -821,12 +847,36 @@ export function HoverRevealShader({
   const [maskCanvas, setMaskCanvas] = useState<HTMLCanvasElement | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
-  const touchGestureRef = useRef<TouchGestureCallbacks>({})
+  const touchGestureRef = useRef<TouchGestureCallbacks>({
+    debug: { touches: 0, mode: "idle", paintStarts: 0, snapshots: 0 },
+  })
 
   useEffect(() => {
     const el = fluidWrapperRef.current?.querySelector("canvas") ?? null
     setMaskCanvas(el)
   }, [])
+
+  // Temporary diagnostic HUD for the "2nd reveal doesn't work on mobile"
+  // report -- ?debug=1 in the URL shows live touch/gate state on-screen so
+  // it's checkable from a phone with no devtools. Remove once root-caused.
+  const [showDebug, setShowDebug] = useState(false)
+  const debugElRef = useRef<HTMLPreElement>(null)
+  useEffect(() => {
+    setShowDebug(new URLSearchParams(window.location.search).has("debug"))
+  }, [])
+  useEffect(() => {
+    if (!showDebug) return
+    let raf: number
+    const tick = () => {
+      const d = touchGestureRef.current.debug
+      if (debugElRef.current) {
+        debugElRef.current.textContent = `touches: ${d.touches}\nmode: ${d.mode}\npaintStarts: ${d.paintStarts}\nsnapshots: ${d.snapshots}`
+      }
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [showDebug])
 
   // The fluid library's own FluidPass (node_modules/@basementstudio/
   // shader-lab) splats on every pointermove/pointerdown it sees, regardless
@@ -840,12 +890,19 @@ export function HoverRevealShader({
     const dispose = createTouchGestureController(wrapper, maskCanvas, {
       onRotateMove: (dx, dy) => touchGestureRef.current.onRotateMove?.(dx, dy),
       onPaintStart: () => touchGestureRef.current.onPaintStart?.(),
+      debug: touchGestureRef.current.debug,
     })
     return dispose
   }, [maskCanvas])
 
   return (
     <div className="relative aspect-square w-full touch-none overscroll-none overflow-hidden rounded-lg border border-neutral-800 bg-black">
+      {showDebug && (
+        <pre
+          ref={debugElRef}
+          className="pointer-events-none absolute left-2 top-2 z-30 whitespace-pre rounded bg-black/80 p-2 text-[10px] leading-tight text-lime-400"
+        />
+      )}
       <div
         ref={fluidWrapperRef}
         className="absolute inset-0 z-10 opacity-0"
