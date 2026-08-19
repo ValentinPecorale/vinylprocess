@@ -687,12 +687,14 @@ function VinylRecord({
   layer3Src,
   maskCanvas,
   touchGestureRef,
+  showDebug,
 }: {
   layer1Src: string
   layer2Src: string
   layer3Src: string
   maskCanvas: HTMLCanvasElement | null
   touchGestureRef: React.RefObject<TouchGestureCallbacks>
+  showDebug: boolean
 }) {
   const layer1Texture = useImageTexture(layer1Src)
   const layer2Texture = useImageTexture(layer2Src)
@@ -727,6 +729,28 @@ function VinylRecord({
     gateRef: mask2GateRef,
   })
 
+  // Debug-only: a stable node previewing mask2GateRef's raw content, sampled
+  // with the same outputUv convention as mask1.node/mask2.node so it can be
+  // tinted directly onto the record surface (same geometry/UV, so it's
+  // trivially aligned -- no separate debug quad or coordinate math needed).
+  // Remove alongside the rest of the ?debug=1 scaffolding once the "2nd
+  // reveal doesn't work" report is root-caused.
+  const gateDebugTexture = useMemo(
+    () => new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1),
+    []
+  )
+  useEffect(() => {
+    gateDebugTexture.needsUpdate = true
+  }, [gateDebugTexture])
+  const gateDebugNode = useMemo(
+    () => tslTexture(gateDebugTexture, viewportMaskUv),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  )
+  useFrame(() => {
+    if (mask2GateRef.current) gateDebugNode.value = mask2GateRef.current
+  })
+
   const { scene } = useGLTF(MODEL_URL)
 
   const buildRevealMaterial = (uvNode: ReturnType<typeof vec2>) => {
@@ -754,14 +778,25 @@ function VinylRecord({
     const revealOpacity2 = revealOpacity2raw.mul(revealOpacity1)
     const stage1 = mix(layer1Node.rgb, layer2Node.rgb, revealOpacity1)
     const stage2 = mix(stage1, layer3Node.rgb, revealOpacity2)
-    mat.colorNode = vec4(stage2, 1)
+    if (showDebug) {
+      // Debug-only overlay: red = gate's raw (unthresholded) value, green =
+      // mask2's raw (unthresholded) accumulator -- both visible even below
+      // REVEAL_HIGH, so we can see partial progress the normal blend hides.
+      // Additive on top of the normal render, so the usual reveal is still
+      // visible underneath. Remove alongside the rest of the ?debug=1
+      // scaffolding once root-caused.
+      const debugTint = vec3(gateDebugNode.r, mask2.node!.r, float(0))
+      mat.colorNode = vec4(stage2.add(debugTint), 1)
+    } else {
+      mat.colorNode = vec4(stage2, 1)
+    }
     return mat
   }
 
   const surfaceMaterial = useMemo(
     () => buildRevealMaterial(uv()),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [layer1Texture, layer2Texture, layer3Texture, mask1.node, mask2.node]
+    [layer1Texture, layer2Texture, layer3Texture, mask1.node, mask2.node, showDebug]
   )
 
   // The label's own UV attribute is degenerate, so build its texture
@@ -780,7 +815,7 @@ function VinylRecord({
           .add(0.5)
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [layer1Texture, layer2Texture, layer3Texture, mask1.node, mask2.node]
+    [layer1Texture, layer2Texture, layer3Texture, mask1.node, mask2.node, showDebug]
   )
 
   const preparedScene = useMemo(() => {
@@ -870,7 +905,7 @@ export function HoverRevealShader({
     const tick = () => {
       const d = touchGestureRef.current.debug
       if (debugElRef.current) {
-        debugElRef.current.textContent = `touches: ${d.touches}\nmode: ${d.mode}\npaintStarts: ${d.paintStarts}\nsnapshots: ${d.snapshots}`
+        debugElRef.current.textContent = `touches: ${d.touches}\nmode: ${d.mode}\npaintStarts: ${d.paintStarts}\nsnapshots: ${d.snapshots}\n\nred tint = gate\ngreen tint = mask2 raw`
       }
       raf = requestAnimationFrame(tick)
     }
@@ -937,6 +972,7 @@ export function HoverRevealShader({
               layer3Src={layer3Src}
               maskCanvas={maskCanvas}
               touchGestureRef={touchGestureRef}
+              showDebug={showDebug}
             />
           </Suspense>
         </Canvas>
