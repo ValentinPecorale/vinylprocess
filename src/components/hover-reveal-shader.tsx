@@ -358,20 +358,40 @@ const LABEL_IMAGE_RADIUS = 0.15
 const ROTATE_SPEED = 0.006
 const ROTATE_PITCH_LIMIT = Math.PI / 3
 
+type TouchGestureCallbacks = {
+  onRotateMove?: (dx: number, dy: number) => void
+  onPaintStart?: () => void
+}
+
 // Right-drag to rotate the model, implemented by hand rather than via
 // OrbitControls: drei's OrbitControls captures the pointer on its
 // domElement, which — since it has to share the same element the fluid
 // composition listens on for hover-to-paint — silently breaks the fluid's
 // own pointer listeners on that element. Plain listeners here coexist fine.
+//
+// `touchGestureRef.current.onRotateMove` is wired up here so the touch-
+// gesture controller (two-finger drag) can drive the exact same rotation
+// math a mouse right-drag uses, since touch has no button to gate on.
 function useManualOrbit(
   domElement: HTMLCanvasElement | null,
-  groupRef: React.RefObject<THREE.Group | null>
+  groupRef: React.RefObject<THREE.Group | null>,
+  touchGestureRef: React.RefObject<TouchGestureCallbacks>
 ) {
   useEffect(() => {
     if (!domElement) return
     let dragging = false
     let lastX = 0
     let lastY = 0
+
+    const applyDelta = (dx: number, dy: number) => {
+      if (!groupRef.current) return
+      groupRef.current.rotation.y += dx * ROTATE_SPEED
+      groupRef.current.rotation.x = THREE.MathUtils.clamp(
+        groupRef.current.rotation.x + dy * ROTATE_SPEED,
+        -ROTATE_PITCH_LIMIT,
+        ROTATE_PITCH_LIMIT
+      )
+    }
 
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 2) return
@@ -380,17 +400,12 @@ function useManualOrbit(
       lastY = e.clientY
     }
     const onPointerMove = (e: PointerEvent) => {
-      if (!dragging || !groupRef.current) return
+      if (!dragging) return
       const dx = e.clientX - lastX
       const dy = e.clientY - lastY
       lastX = e.clientX
       lastY = e.clientY
-      groupRef.current.rotation.y += dx * ROTATE_SPEED
-      groupRef.current.rotation.x = THREE.MathUtils.clamp(
-        groupRef.current.rotation.x + dy * ROTATE_SPEED,
-        -ROTATE_PITCH_LIMIT,
-        ROTATE_PITCH_LIMIT
-      )
+      applyDelta(dx, dy)
     }
     const onPointerUp = () => {
       dragging = false
@@ -403,14 +418,16 @@ function useManualOrbit(
     window.addEventListener("pointermove", onPointerMove)
     window.addEventListener("pointerup", onPointerUp)
     domElement.addEventListener("contextmenu", onContextMenu)
+    touchGestureRef.current.onRotateMove = applyDelta
 
     return () => {
       domElement.removeEventListener("pointerdown", onPointerDown)
       window.removeEventListener("pointermove", onPointerMove)
       window.removeEventListener("pointerup", onPointerUp)
       domElement.removeEventListener("contextmenu", onContextMenu)
+      touchGestureRef.current.onRotateMove = undefined
     }
-  }, [domElement, groupRef])
+  }, [domElement, groupRef, touchGestureRef])
 }
 
 // Renders a true, static, point-in-time GPU copy of `sourceRef`'s current
@@ -429,7 +446,8 @@ function useManualOrbit(
 // ever reflects "what was already achieved before this stroke began".
 function useStrokeSnapshotTexture(
   domElement: HTMLCanvasElement | null,
-  sourceRef: { current: THREE.Texture | null }
+  sourceRef: { current: THREE.Texture | null },
+  touchGestureRef: React.RefObject<TouchGestureCallbacks>
 ) {
   const { gl: rawGl } = useThree()
   const gl = rawGl as unknown as WebGPURenderer
@@ -481,12 +499,23 @@ function useStrokeSnapshotTexture(
   useEffect(() => {
     if (!domElement) return
     const onPointerDown = (e: PointerEvent) => {
+      // Touch paint-start is driven exclusively by the touch-gesture
+      // controller's onPaintStart callback below -- a second finger
+      // landing also satisfies button===0 and would otherwise re-mark a
+      // stroke as pending mid-rotate.
+      if (e.pointerType === "touch") return
       if (e.button !== 0) return
       if (stateRef.current) stateRef.current.pending = true
     }
     domElement.addEventListener("pointerdown", onPointerDown)
-    return () => domElement.removeEventListener("pointerdown", onPointerDown)
-  }, [domElement])
+    touchGestureRef.current.onPaintStart = () => {
+      if (stateRef.current) stateRef.current.pending = true
+    }
+    return () => {
+      domElement.removeEventListener("pointerdown", onPointerDown)
+      touchGestureRef.current.onPaintStart = undefined
+    }
+  }, [domElement, touchGestureRef])
 
   useFrame(() => {
     const state = stateRef.current
@@ -502,16 +531,134 @@ function useStrokeSnapshotTexture(
   return snapshotRef
 }
 
+// Touch-only gesture controller: one finger paints (scroll is locked via
+// `touch-none` on the outer container, see HoverRevealShader), a second
+// finger switches to rotate. Mouse/pen are untouched -- they keep using the
+// button-gated listeners in useManualOrbit/useStrokeSnapshotTexture above.
+// Plain function (not a hook) so this stays textually close to its
+// navbardano port (vinyl-reveal.js's createTouchGestureController), which
+// this file is the original source of.
+//
+// Two listener scopes, same split as useManualOrbit's mouse path:
+//  - `wrapperEl`, capture phase: decides whether an event may reach the
+//    fluid-paint canvas at all (must run before FluidPass's own listener,
+//    which is bound directly on that canvas).
+//  - `window`: tracks finger positions/deltas so a finger that drags
+//    outside the tile's bounds is still tracked, matching mouse behavior.
+function createTouchGestureController(
+  wrapperEl: HTMLElement,
+  canvasEl: HTMLCanvasElement | null,
+  { onPaintStart, onRotateMove }: TouchGestureCallbacks
+) {
+  const touches = new Map<number, { x: number; y: number }>()
+  let mode: "idle" | "paint" | "rotate" = "idle"
+  let primaryId: number | null = null
+
+  function onWrapperPointerDownCapture(event: PointerEvent) {
+    // Mouse pointerdown is left alone here, matching the existing
+    // blockHoverPaint rationale: a button is already down when it fires,
+    // so it's exactly a drag's first sample, not a hover.
+    if (event.pointerType !== "touch") return
+    const wasEmpty = touches.size === 0
+    touches.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    if (wasEmpty) {
+      primaryId = event.pointerId
+      mode = "paint"
+      onPaintStart?.()
+      // First finger's own touchdown is a legitimate first stroke sample --
+      // let it through.
+      return
+    }
+    if (touches.size === 2) {
+      mode = "rotate"
+    }
+    // Any touchdown beyond the first (the 2nd finger landing, or a stray
+    // 3rd+) must never reach the fluid canvas as a paint sample.
+    event.stopPropagation()
+  }
+
+  function onWrapperPointerMoveCapture(event: PointerEvent) {
+    if (event.pointerType !== "touch") {
+      if (event.buttons === 0) event.stopPropagation()
+      return
+    }
+    if (mode === "rotate") event.stopPropagation()
+  }
+
+  function endTouch(pointerId: number) {
+    if (!touches.has(pointerId)) return
+    const wasRotating = mode === "rotate"
+    touches.delete(pointerId)
+
+    if (touches.size === 0) {
+      mode = "idle"
+      primaryId = null
+      return
+    }
+
+    if (wasRotating) {
+      // Dropping back to one finger: resume painting immediately with the
+      // remaining finger. FluidPass tracks a single shared
+      // lastPointerX/lastPointerY, reset to null only on `pointerleave` --
+      // since every touch event was blocked from it during rotate, that
+      // state is stale (last real value came from the primary finger,
+      // before the 2nd finger landed). A synthetic pointerleave nulls it,
+      // so the remaining finger's next real pointermove just re-anchors
+      // position instead of diffing against stale coordinates and
+      // splatting a spurious jump.
+      canvasEl?.dispatchEvent(
+        new PointerEvent("pointerleave", { bubbles: false, cancelable: false })
+      )
+      const remaining = touches.keys().next().value as number
+      primaryId = remaining
+      mode = "paint"
+    }
+  }
+
+  function onWindowPointerMove(event: PointerEvent) {
+    if (event.pointerType !== "touch") return
+    const last = touches.get(event.pointerId)
+    if (!last) return
+    const dx = event.clientX - last.x
+    const dy = event.clientY - last.y
+    touches.set(event.pointerId, { x: event.clientX, y: event.clientY })
+    if (mode === "rotate" && event.pointerId === primaryId) {
+      onRotateMove?.(dx, dy)
+    }
+  }
+
+  function onWindowPointerUp(event: PointerEvent) {
+    if (event.pointerType !== "touch") return
+    endTouch(event.pointerId)
+  }
+
+  wrapperEl.addEventListener("pointerdown", onWrapperPointerDownCapture, true)
+  wrapperEl.addEventListener("pointermove", onWrapperPointerMoveCapture, true)
+  window.addEventListener("pointermove", onWindowPointerMove)
+  window.addEventListener("pointerup", onWindowPointerUp)
+  window.addEventListener("pointercancel", onWindowPointerUp)
+
+  return function dispose() {
+    wrapperEl.removeEventListener("pointerdown", onWrapperPointerDownCapture, true)
+    wrapperEl.removeEventListener("pointermove", onWrapperPointerMoveCapture, true)
+    window.removeEventListener("pointermove", onWindowPointerMove)
+    window.removeEventListener("pointerup", onWindowPointerUp)
+    window.removeEventListener("pointercancel", onWindowPointerUp)
+  }
+}
+
 function VinylRecord({
   layer1Src,
   layer2Src,
   layer3Src,
   maskCanvas,
+  touchGestureRef,
 }: {
   layer1Src: string
   layer2Src: string
   layer3Src: string
   maskCanvas: HTMLCanvasElement | null
+  touchGestureRef: React.RefObject<TouchGestureCallbacks>
 }) {
   const layer1Texture = useImageTexture(layer1Src)
   const layer2Texture = useImageTexture(layer2Src)
@@ -539,7 +686,7 @@ function VinylRecord({
     outputUv: viewportMaskUv,
     creepGain: CREEP_GAIN,
   })
-  const mask2GateRef = useStrokeSnapshotTexture(maskCanvas, mask1.latchRef)
+  const mask2GateRef = useStrokeSnapshotTexture(maskCanvas, mask1.latchRef, touchGestureRef)
   const mask2 = useLatchedMask(maskCanvas, {
     outputUv: viewportMaskUv,
     creepGain: CREEP_GAIN,
@@ -619,7 +766,7 @@ function VinylRecord({
 
   const { camera } = useThree()
   const groupRef = useRef<THREE.Group>(null)
-  useManualOrbit(maskCanvas, groupRef)
+  useManualOrbit(maskCanvas, groupRef, touchGestureRef)
 
   useEffect(() => {
     const box = new THREE.Box3().setFromObject(preparedScene)
@@ -666,6 +813,7 @@ export function HoverRevealShader({
   const [maskCanvas, setMaskCanvas] = useState<HTMLCanvasElement | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
+  const touchGestureRef = useRef<TouchGestureCallbacks>({})
 
   useEffect(() => {
     const el = fluidWrapperRef.current?.querySelector("canvas") ?? null
@@ -673,29 +821,23 @@ export function HoverRevealShader({
   }, [])
 
   // The fluid library's own FluidPass (node_modules/@basementstudio/
-  // shader-lab) splats on every pointermove it sees, regardless of button
-  // state -- there's no config for "only while dragging". Its listener is
-  // bound directly to the canvas, so intercepting on that same element
-  // would fire after it (both listeners are "at target", where DOM order
-  // is registration order, not capture-vs-bubble). Stopping propagation
-  // one level up, on the wrapper, during the capture phase runs before the
-  // event ever reaches the canvas. pointerdown is left alone -- by
-  // definition a button is already down when that fires, so it's exactly
-  // a drag's first sample, not a hover.
+  // shader-lab) splats on every pointermove/pointerdown it sees, regardless
+  // of button state -- there's no config for "only while dragging".
+  // createTouchGestureController owns the wrapper-capture interception that
+  // gates this (mouse hover-paint gating + touch 1-finger-paint/2-finger-
+  // rotate disambiguation), replacing the old standalone blockHoverPaint.
   useEffect(() => {
     const wrapper = fluidWrapperRef.current
     if (!wrapper) return
-    const blockHoverPaint = (event: PointerEvent) => {
-      if (event.buttons === 0) event.stopPropagation()
-    }
-    wrapper.addEventListener("pointermove", blockHoverPaint, true)
-    return () => {
-      wrapper.removeEventListener("pointermove", blockHoverPaint, true)
-    }
-  }, [])
+    const dispose = createTouchGestureController(wrapper, maskCanvas, {
+      onRotateMove: (dx, dy) => touchGestureRef.current.onRotateMove?.(dx, dy),
+      onPaintStart: () => touchGestureRef.current.onPaintStart?.(),
+    })
+    return dispose
+  }, [maskCanvas])
 
   return (
-    <div className="relative aspect-square w-full overflow-hidden rounded-lg border border-neutral-800 bg-black">
+    <div className="relative aspect-square w-full touch-none overscroll-none overflow-hidden rounded-lg border border-neutral-800 bg-black">
       <div
         ref={fluidWrapperRef}
         className="absolute inset-0 z-10 opacity-0"
@@ -729,6 +871,7 @@ export function HoverRevealShader({
               layer2Src={layer2Src}
               layer3Src={layer3Src}
               maskCanvas={maskCanvas}
+              touchGestureRef={touchGestureRef}
             />
           </Suspense>
         </Canvas>
