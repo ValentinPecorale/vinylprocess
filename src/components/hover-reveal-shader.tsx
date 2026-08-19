@@ -632,18 +632,26 @@ function createTouchGestureController(
     endTouch(event.pointerId)
   }
 
+  // Capture phase on window too, and not just for symmetry with the
+  // wrapper listeners: window precedes the wrapper in the capture
+  // traversal (window -> document -> ... -> wrapperEl -> target), so a
+  // capture-phase listener here always sees the event before
+  // onWrapperPointerMoveCapture's stopPropagation (during rotate) can cut
+  // the dispatch short. A bubble-phase listener here would never fire in
+  // that case, since stopPropagation during capture halts the entire
+  // dispatch, including the later bubble phase back up to window.
   wrapperEl.addEventListener("pointerdown", onWrapperPointerDownCapture, true)
   wrapperEl.addEventListener("pointermove", onWrapperPointerMoveCapture, true)
-  window.addEventListener("pointermove", onWindowPointerMove)
-  window.addEventListener("pointerup", onWindowPointerUp)
-  window.addEventListener("pointercancel", onWindowPointerUp)
+  window.addEventListener("pointermove", onWindowPointerMove, true)
+  window.addEventListener("pointerup", onWindowPointerUp, true)
+  window.addEventListener("pointercancel", onWindowPointerUp, true)
 
   return function dispose() {
     wrapperEl.removeEventListener("pointerdown", onWrapperPointerDownCapture, true)
     wrapperEl.removeEventListener("pointermove", onWrapperPointerMoveCapture, true)
-    window.removeEventListener("pointermove", onWindowPointerMove)
-    window.removeEventListener("pointerup", onWindowPointerUp)
-    window.removeEventListener("pointercancel", onWindowPointerUp)
+    window.removeEventListener("pointermove", onWindowPointerMove, true)
+    window.removeEventListener("pointerup", onWindowPointerUp, true)
+    window.removeEventListener("pointercancel", onWindowPointerUp, true)
   }
 }
 
