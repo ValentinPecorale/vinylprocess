@@ -136,6 +136,7 @@ function useLatchedMask(
     prevNode: ReturnType<typeof tslTexture>
     outputNode: ReturnType<typeof tslTexture>
     gateNode: ReturnType<typeof tslTexture> | null
+    gate: ReturnType<typeof smoothstep> | null
     fluidCanvas: HTMLCanvasElement
     probeCtx: CanvasRenderingContext2D
     startedAt: number
@@ -164,8 +165,18 @@ function useLatchedMask(
     // Backed by this mask's own still-cleared rtA until the gate ref hands
     // over a real frame -- reads as "not revealed yet", the correct
     // default, so there's no premature creep before the gate mask exists.
+    //
+    // viewportMaskUv, NOT renderTargetUv: the gate ref
+    // (useStrokeSnapshotTexture's rt.texture) is a snapshot-of-a-render-
+    // target, one hop removed from mask1's own rtA/rtB -- it already read
+    // its source via renderTargetUv and wrote out through a plain,
+    // uncorrected uv(), which undoes the storage-orientation flip once.
+    // Reading it again with renderTargetUv double-flips it (confirmed by
+    // comparing against gateDebugNode's viewportMaskUv reading of the same
+    // texture in the ?debug=1 overlay -- they only agreed once this used
+    // viewportMaskUv too).
     const gateNode = options?.gateRef
-      ? tslTexture(rtA.texture, renderTargetUv)
+      ? tslTexture(rtA.texture, viewportMaskUv)
       : null
     const gate = gateNode
       ? smoothstep(REVEAL_LOW, REVEAL_HIGH, dot(gateNode.rgb, LUMINANCE_WEIGHTS))
@@ -177,6 +188,11 @@ function useLatchedMask(
 
     const mat = new MeshBasicNodeMaterial()
     mat.colorNode = vec4(vec3(latched), 1)
+    // This is a raw data accumulator (a latch value, not a display color)
+    // -- letting the shared renderer's tone mapping (e.g. ACES Filmic,
+    // which compresses highlights) apply here would quietly corrupt the
+    // very numbers REVEAL_LOW/HIGH threshold against.
+    mat.toneMapped = false
 
     const scene = new THREE.Scene()
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
@@ -209,6 +225,7 @@ function useLatchedMask(
       prevNode,
       outputNode,
       gateNode,
+      gate,
       fluidCanvas,
       probeCtx,
       startedAt: Date.now(),
@@ -279,6 +296,13 @@ function useLatchedMask(
     // SAME texture to check for a UV-convention mismatch. Remove alongside
     // the rest of the ?debug=1 scaffolding.
     gateNode: ready ? stateRef.current?.gateNode ?? null : null,
+    // Debug-only: the ACTUAL thresholded (smoothstepped) gate value this
+    // hook gates its own accumulation with, as opposed to gateNode's raw
+    // (pre-threshold) reading -- lets us tell apart "gate texture reads a
+    // mismatched region" from "gate reads correctly but never crosses
+    // REVEAL_LOW/HIGH". Remove alongside the rest of the ?debug=1
+    // scaffolding.
+    gate: ready ? stateRef.current?.gate ?? null : null,
   }
 }
 
@@ -487,6 +511,11 @@ function useStrokeSnapshotTexture(
     const sourceNode = tslTexture(blackTex, renderTargetUv)
     const mat = new MeshBasicNodeMaterial()
     mat.colorNode = vec4(sourceNode.rgb, 1)
+    // Same reasoning as useLatchedMask's own accumulation material: this
+    // copies a raw latch value verbatim for later thresholding, not a
+    // display color -- tone mapping here would compress it before mask2
+    // ever gets to compare it against REVEAL_LOW/HIGH.
+    mat.toneMapped = false
 
     const scene = new THREE.Scene()
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1)
@@ -793,11 +822,12 @@ function VinylRecord({
       // displayed vs how it's actually consumed for gating, pinpointing the
       // bug. Additive on top of the normal render. Remove alongside the
       // rest of the ?debug=1 scaffolding once root-caused.
-      const debugTint = vec3(
-        gateDebugNode.r,
-        mask2.node!.r,
-        mask2.gateNode ? mask2.gateNode.r : float(0)
-      )
+      // Diagnostic-only, much lower threshold (0.05-0.15 instead of the
+      // real REVEAL_LOW/HIGH 0.35/0.55) applied to the SAME raw gateNode
+      // reading, to tell apart "raw gate is genuinely near-zero here" from
+      // "raw gate is weak-but-nonzero, just never strong enough to cross
+      // the real threshold". Doesn't touch the actual gating logic at all.
+      const debugTint = vec3(gateDebugNode.r, mask2.node!.r, mask2.gate ? mask2.gate : float(0))
       mat.colorNode = vec4(stage2.add(debugTint), 1)
     } else {
       mat.colorNode = vec4(stage2, 1)
@@ -917,7 +947,7 @@ export function HoverRevealShader({
     const tick = () => {
       const d = touchGestureRef.current.debug
       if (debugElRef.current) {
-        debugElRef.current.textContent = `touches: ${d.touches}\nmode: ${d.mode}\npaintStarts: ${d.paintStarts}\nsnapshots: ${d.snapshots}\n\nred = gate (viewportUV)\ngreen = mask2 raw\nblue = gate (internal, renderTargetUv)`
+        debugElRef.current.textContent = `touches: ${d.touches}\nmode: ${d.mode}\npaintStarts: ${d.paintStarts}\nsnapshots: ${d.snapshots}\n\nred = gate raw (viewportUV)\ngreen = mask2 raw\nblue = gate thresholded (real REVEAL_LOW/HIGH)`
       }
       raf = requestAnimationFrame(tick)
     }
