@@ -273,6 +273,12 @@ function useLatchedMask(
   return {
     node: ready ? stateRef.current?.outputNode ?? null : null,
     latchRef,
+    // Debug-only: exposes the exact node this hook internally uses to read
+    // its OWN gateRef texture (renderTargetUv-sampled), so it can be
+    // compared against an externally-built viewportMaskUv reading of the
+    // SAME texture to check for a UV-convention mismatch. Remove alongside
+    // the rest of the ?debug=1 scaffolding.
+    gateNode: ready ? stateRef.current?.gateNode ?? null : null,
   }
 }
 
@@ -779,13 +785,19 @@ function VinylRecord({
     const stage1 = mix(layer1Node.rgb, layer2Node.rgb, revealOpacity1)
     const stage2 = mix(stage1, layer3Node.rgb, revealOpacity2)
     if (showDebug) {
-      // Debug-only overlay: red = gate's raw (unthresholded) value, green =
-      // mask2's raw (unthresholded) accumulator -- both visible even below
-      // REVEAL_HIGH, so we can see partial progress the normal blend hides.
-      // Additive on top of the normal render, so the usual reveal is still
-      // visible underneath. Remove alongside the rest of the ?debug=1
-      // scaffolding once root-caused.
-      const debugTint = vec3(gateDebugNode.r, mask2.node!.r, float(0))
+      // Debug-only overlay: red = gate's raw value read externally via
+      // viewportMaskUv (gateDebugNode), green = mask2's raw accumulator,
+      // blue = the SAME gate texture read the way mask2 reads it
+      // INTERNALLY (via renderTargetUv, mask2.gateNode) -- if red and blue
+      // disagree, that's a UV-convention mismatch between how the gate is
+      // displayed vs how it's actually consumed for gating, pinpointing the
+      // bug. Additive on top of the normal render. Remove alongside the
+      // rest of the ?debug=1 scaffolding once root-caused.
+      const debugTint = vec3(
+        gateDebugNode.r,
+        mask2.node!.r,
+        mask2.gateNode ? mask2.gateNode.r : float(0)
+      )
       mat.colorNode = vec4(stage2.add(debugTint), 1)
     } else {
       mat.colorNode = vec4(stage2, 1)
@@ -905,7 +917,7 @@ export function HoverRevealShader({
     const tick = () => {
       const d = touchGestureRef.current.debug
       if (debugElRef.current) {
-        debugElRef.current.textContent = `touches: ${d.touches}\nmode: ${d.mode}\npaintStarts: ${d.paintStarts}\nsnapshots: ${d.snapshots}\n\nred tint = gate\ngreen tint = mask2 raw`
+        debugElRef.current.textContent = `touches: ${d.touches}\nmode: ${d.mode}\npaintStarts: ${d.paintStarts}\nsnapshots: ${d.snapshots}\n\nred = gate (viewportUV)\ngreen = mask2 raw\nblue = gate (internal, renderTargetUv)`
       }
       raf = requestAnimationFrame(tick)
     }
